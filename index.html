@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>NameTag OBS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap">
+<style>
+  /* Police Minecraft : dépose minecraft.ttf à côté de ce fichier. Sinon "Press Start 2P" sert de secours. */
+  @font-face { font-family: "MC"; src: url("minecraft.ttf") format("truetype")}
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  body.obs { background: transparent; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #src { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<video id="src" playsinline autoplay muted></video>
+<canvas id="out"></canvas>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+/* ============================ CONFIG ============================
+   Mets ton URL source ici. Elle peut aussi être passée dans l'URL de la page :
+   https://TON-PSEUDO.github.io/TON-REPO/?url=<URL encodée>&name=Mathys
+   Tous les réglages ci-dessous peuvent être surchargés avec ?cle=valeur
+   Valeurs possibles de url : "0" (webcam) | lien VDO.Ninja | .m3u8 | .mp4/.webm (CORS requis) */
+const CONFIG = {
+  url: "https://vdo.ninja/?view=viqr6Rb",
+  audio: false,                 // true = laisse passer le son du flux
+  // Texte
+  name: "Mathys", font_size: 50, pixel_text: true,
+  text_color: "#FFFFFF", shadow: true, shadow_color: "#3F3F3F", shadow_offset: 4,
+  // Fond (bg_opacity = transparence en %, comme dans ton script)
+  bg_enabled: true, bg_color: "#000000", bg_opacity: 50, pad_x: 25, pad_y: 19,
+  border_enabled: false, border_color: "#FFFFFF", border_width: 3,
+  // Position / suivi
+  // ref_height = hauteur de sortie de ton script (out_res 640x360 -> 360) : garde les mêmes proportions
+  ref_height: 360,
+  offset_y: 126, offset_x: 31, scale: 53, follow_scale: true, follow_roll: false,
+  smoothing: 0, lost_frames: 0, det_conf: 22, track_conf: 22, face_skip: 3,
+  // Points du visage : none | keys | contours | all
+  dots_mode: "none", dots_color: "#00FF66", dots_size: 2,
+  // Image
+  mirror: false, fit_mode: "cover",   // cover | contain | stretch
+  brightness: 0, contrast: 100,
+  status: true                        // affiche l'état tant que le flux n'est pas là
+};
+/* ================================================================ */
+
+const Q = new URLSearchParams(location.search);
+for (const k in CONFIG) {
+  if (!Q.has(k)) continue;
+  const d = CONFIG[k], v = Q.get(k);
+  CONFIG[k] = typeof d === "boolean" ? /^(1|true|yes|on)$/i.test(v)
+            : typeof d === "number" ? Number(v) : v;
+}
+const C = CONFIG;
+if (window.obsstudio) document.body.classList.add("obs");
+
+const video = document.getElementById("src");
+const canvas = document.getElementById("out");
+const ctx = canvas.getContext("2d");
+video.muted = !C.audio;
+
+let statusMsg = "Démarrage...";
+const setStatus = m => { statusMsg = m; console.log("[NameTag]", m); };
+
+/* --------------------------- sources --------------------------- */
+const loadScript = src => new Promise((res, rej) => {
+  const s = document.createElement("script");
+  s.src = src; s.onload = res; s.onerror = () => rej(new Error("Chargement impossible : " + src));
+  document.head.appendChild(s);
+});
+
+let cleanup = () => {};
+let lastFrameAt = performance.now(), lastTime = -1, isLive = true;
+
+async function startSource() {
+  await cleanup(); cleanup = () => {};
+  video.srcObject = null; video.removeAttribute("src");
+  const url = (C.url || "").trim();
+  lastFrameAt = performance.now();
+  try {
+    if (url === "" || /^\d+$/.test(url)) {
+      setStatus("Webcam...");
+      const st = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      video.srcObject = st; isLive = true;
+      cleanup = () => st.getTracks().forEach(t => t.stop());
+    } else if (/vdo\.ninja|obs\.ninja/i.test(url)) {
+      await startVdo(url); isLive = true;
+    } else if (/\.m3u8(\?|$)/i.test(url)) {
+      isLive = true;
+      if (video.canPlayType("application/vnd.apple.mpegurl")) { video.crossOrigin = "anonymous"; video.src = url; }
+      else {
+        await loadScript("https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js");
+        const hls = new Hls(); video.crossOrigin = "anonymous";
+        hls.loadSource(url); hls.attachMedia(video);
+        cleanup = () => hls.destroy();
+      }
+    } else {
+      isLive = false; video.crossOrigin = "anonymous"; video.loop = true; video.src = url;
+    }
+    await video.play().catch(() => {});
+    setStatus("Attente de l'image...");
+  } catch (e) {
+    setStatus("Erreur source : " + (e.message || e)); setTimeout(startSource, 4000);
+  }
+}
+
+async function startVdo(url) {
+  setStatus("VDO.Ninja : chargement du SDK...");
+  if (!window.VDONinjaSDK)
+    await loadScript("https://cdn.jsdelivr.net/gh/steveseguin/ninjasdk@latest/vdoninja-sdk.min.js");
+  const u = new URL(url), p = u.searchParams;
+  const streamID = p.get("view") || p.get("v");
+  if (!streamID) throw new Error("URL VDO.Ninja sans ?view=ID");
+  const room = p.get("room") || p.get("r");
+  const pw = p.get("password") || p.get("pw") || p.get("p");
+  const opts = { salt: "vdo.ninja" };
+  if (pw === "false") opts.password = false; else if (pw) opts.password = pw;
+  const wss = p.get("wss");
+  if (wss) opts.host = "wss://" + wss;
+  const vdo = new VDONinjaSDK(opts);
+  const stream = new MediaStream();
+  vdo.addEventListener("track", e => {
+    const t = e.detail.track;
+    if (t.kind === "video" || C.audio) stream.addTrack(t);
+    if (video.srcObject !== stream) video.srcObject = stream;
+    video.play().catch(() => {});
+    setStatus("VDO.Ninja : flux reçu");
+  });
+  vdo.addEventListener("error", e => setStatus("VDO.Ninja : " + (e.detail?.error?.message || "erreur")));
+  cleanup = async () => { try { await vdo.disconnect(); } catch (e) {} };
+  setStatus("VDO.Ninja : connexion...");
+  await vdo.connect();
+  if (room) await vdo.joinRoom({ room, password: opts.password });
+  await vdo.view(streamID, { audio: !!C.audio, video: true });
+  setStatus("VDO.Ninja : attente du flux " + streamID + "...");
+}
+
+/* --------------------------- nametag --------------------------- */
+let badge = null;
+async function buildBadge() {
+  const font = `${C.font_size}px MC, "Press Start 2P", monospace`;
+  try { await document.fonts.load(font, C.name || " "); } catch (e) {}
+  const text = C.name || " ";
+  const m = document.createElement("canvas").getContext("2d");
+  m.font = font;
+  const t = m.measureText(text);
+  const left = t.actualBoundingBoxLeft, asc = t.actualBoundingBoxAscent;
+  const tw = Math.ceil(left + t.actualBoundingBoxRight), th = Math.ceil(asc + t.actualBoundingBoxDescent);
+  const sh = C.shadow ? C.shadow_offset : 0, bd = C.border_enabled ? C.border_width : 0;
+  const W = Math.max(1, tw + 2 * C.pad_x + sh + 2 * bd), H = Math.max(1, th + 2 * C.pad_y + sh + 2 * bd);
+  const cv = document.createElement("canvas"); cv.width = W; cv.height = H;
+  const g = cv.getContext("2d");
+  if (C.bg_enabled) {
+    g.globalAlpha = 1 - C.bg_opacity / 100; g.fillStyle = C.bg_color; g.fillRect(0, 0, W, H); g.globalAlpha = 1;
+  }
+  if (bd) { g.strokeStyle = C.border_color; g.lineWidth = bd * 2; g.strokeRect(0, 0, W, H); }
+  // texte sur un calque séparé (pour pouvoir supprimer le lissage = style pixel)
+  const tl = document.createElement("canvas"); tl.width = W; tl.height = H;
+  const tg = tl.getContext("2d");
+  tg.font = font; tg.textBaseline = "alphabetic";
+  const tx = bd + C.pad_x + left, ty = bd + C.pad_y + asc;
+  if (sh) { tg.fillStyle = C.shadow_color; tg.fillText(text, tx + sh, ty + sh); }
+  tg.fillStyle = C.text_color; tg.fillText(text, tx, ty);
+  if (C.pixel_text) {
+    const id = tg.getImageData(0, 0, W, H), d = id.data;
+    for (let i = 3; i < d.length; i += 4) d[i] = d[i] > 127 ? 255 : 0;
+    tg.putImageData(id, 0, 0);
+  }
+  g.drawImage(tl, 0, 0);
+  badge = cv;
+}
+
+/* --------------------------- suivi visage --------------------------- */
+let landmarker = null;
+async function initTracker() {
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const base = { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" };
+  const common = {
+    runningMode: "VIDEO", numFaces: 1,
+    minFaceDetectionConfidence: C.det_conf / 100,
+    minFacePresenceConfidence: C.det_conf / 100,
+    minTrackingConfidence: C.track_conf / 100
+  };
+  try { landmarker = await FaceLandmarker.createFromOptions(fileset, { ...common, baseOptions: { ...base, delegate: "GPU" } }); }
+  catch (e) { landmarker = await FaceLandmarker.createFromOptions(fileset, { ...common, baseOptions: { ...base, delegate: "CPU" } }); }
+}
+
+const contourIdx = [...new Set(FaceLandmarker.FACE_LANDMARKS_CONTOURS.flatMap(c => [c.start, c.end]))];
+const keyIdx = [10, 152, 234, 454, 1, 4, 33, 263, 133, 362, 61, 291, 13, 14, 105, 334, 70, 300, 168, 6];
+
+let target = null, state = null, lost = 0, lastDetectTs = 0, frameCount = 0, lastVideoT = -1;
+
+function fitRect(cw, ch, vw, vh) {
+  if (C.fit_mode === "stretch") return { dx: 0, dy: 0, dw: cw, dh: ch };
+  const sc = C.fit_mode === "contain" ? Math.min(cw / vw, ch / vh) : Math.max(cw / vw, ch / vh);
+  const dw = vw * sc, dh = vh * sc;
+  return { dx: (cw - dw) / 2, dy: (ch - dh) / 2, dw, dh };
+}
+
+function track(r, cw, ch) {
+  frameCount++;
+  const skip = Math.max(1, C.face_skip | 0);
+  if (!landmarker || video.currentTime === lastVideoT || (state && frameCount % skip)) return;
+  lastVideoT = video.currentTime;
+  const ts = Math.max(performance.now(), lastDetectTs + 1); lastDetectTs = ts;
+  let res;
+  try { res = landmarker.detectForVideo(video, ts); } catch (e) { return; }
+  const lm = res.faceLandmarks && res.faceLandmarks[0];
+  if (!lm) { if (++lost > C.lost_frames) { target = null; state = null; } return; }
+  lost = 0;
+  const P = i => ({ x: (C.mirror ? r.dx + r.dw - lm[i].x * r.dw : r.dx + lm[i].x * r.dw), y: r.dy + lm[i].y * r.dh });
+  const top = P(10), chin = P(152), l = P(234), rt = P(454);
+  let ang = Math.atan2(rt.y - l.y, rt.x - l.x) * 180 / Math.PI;
+  if (ang > 90) ang -= 180; else if (ang < -90) ang += 180;
+  const faceH = Math.hypot(chin.x - top.x, chin.y - top.y);
+  target = { x: top.x, y: top.y, s: faceH / (0.40 * ch), a: ang };
+  if (!state) state = { ...target };
+  if (C.dots_mode !== "none") target.dots = (C.dots_mode === "keys" ? keyIdx : C.dots_mode === "contours" ? contourIdx : lm.map((_, i) => i)).map(P);
+}
+
+function drawBadge(cw, ch, dt) {
+  if (!state || !target || !badge) return;
+  const k = Math.min(Math.max(C.smoothing / 100, 0), 0.97);
+  const f = 1 - Math.pow(k, dt * 30);            // lissage indépendant du framerate
+  for (const key of ["x", "y", "s", "a"]) state[key] += (target[key] - state[key]) * f;
+  let sc = (C.follow_scale ? state.s : 1) * C.scale / 100;
+  sc = Math.min(Math.max(sc, 0.05), 6) * (ch / C.ref_height);
+  const bw = badge.width * sc, bh = badge.height * sc;
+  const a = C.follow_roll ? state.a * Math.PI / 180 : 0;
+  const off = C.offset_y * sc + bh / 2, ox = C.offset_x * sc;
+  const cx = state.x + Math.sin(a) * off + Math.cos(a) * ox;
+  const cy = state.y - Math.cos(a) * off + Math.sin(a) * ox;
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(a);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(badge, -bw / 2, -bh / 2, bw, bh);
+  ctx.restore();
+  if (target.dots) {
+    ctx.fillStyle = C.dots_color;
+    for (const p of target.dots) { ctx.beginPath(); ctx.arc(p.x, p.y, C.dots_size, 0, 7); ctx.fill(); }
+  }
+}
+
+/* --------------------------- boucle de rendu --------------------------- */
+let prev = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - prev) / 1000, 0.25); prev = now;
+  const cw = window.innerWidth, ch = window.innerHeight;
+  if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
+  ctx.clearRect(0, 0, cw, ch);
+  const ok = video.readyState >= 2 && video.videoWidth > 0;
+  if (ok) {
+    if (video.currentTime !== lastTime) { lastTime = video.currentTime; lastFrameAt = performance.now(); }
+    const r = fitRect(cw, ch, video.videoWidth, video.videoHeight);
+    ctx.save();
+    if (C.brightness !== 0 || C.contrast !== 100)
+      ctx.filter = `brightness(${1 + C.brightness / 128}) contrast(${C.contrast / 100})`;
+    if (C.mirror) { ctx.translate(cw, 0); ctx.scale(-1, 1); }
+    ctx.drawImage(video, r.dx, r.dy, r.dw, r.dh);
+    ctx.restore();
+    track(r, cw, ch);
+    drawBadge(cw, ch, dt);
+  } else if (C.status) {
+    ctx.fillStyle = "#fff"; ctx.font = "16px sans-serif"; ctx.fillText(statusMsg, 20, 30);
+  }
+  // flux figé trop longtemps (source en direct) -> reconnexion
+  if (isLive && performance.now() - lastFrameAt > 12000) { lastFrameAt = performance.now(); startSource(); }
+}
+
+/* --------------------------- démarrage --------------------------- */
+(async () => {
+  await buildBadge();
+  startSource();
+  requestAnimationFrame(frame);
+  try { await initTracker(); } catch (e) { setStatus("Suivi visage indisponible : " + e.message); }
+})();
+</script>
+</body>
+</html>
